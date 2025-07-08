@@ -22,6 +22,8 @@ module Utils.Filter exposing
 
 import Char
 import Data.Matcher
+import Hex
+import Json.Encode as Encode
 import Parser exposing ((|.), (|=), Parser, Trailing(..))
 import Set
 import Url exposing (percentEncode)
@@ -278,9 +280,7 @@ stringifyMatcher { key, op, value } =
                 |> Maybe.map Tuple.first
                 |> Maybe.withDefault ""
            )
-        ++ "\""
-        ++ value
-        ++ "\""
+        ++ Encode.encode 0 (Encode.string value)
 
 
 convertFilterMatcher : Matcher -> Data.Matcher.Matcher
@@ -334,26 +334,136 @@ item =
         |= string '"'
 
 
+type alias StringHelpState =
+    { separator : Char
+    , chars : List Char
+    }
+
+
 string : Char -> Parser String
 string separator =
-    Parser.succeed ()
+    Parser.succeed identity
         |. Parser.token (String.fromChar separator)
-        |. Parser.loop separator stringHelp
-        |> Parser.getChompedString
-        -- Remove quotes
-        |> Parser.map (String.dropLeft 1 >> String.dropRight 1)
+        |= Parser.loop (StringHelpState separator []) stringHelp
+        |> Parser.andThen
+            (\ms ->
+                case ms of
+                    Just s ->
+                        Parser.succeed s
+
+                    Nothing ->
+                        Parser.problem "failed to parse string literal"
+            )
 
 
-stringHelp : Char -> Parser (Parser.Step Char ())
-stringHelp separator =
+
+{- All unescaping is based on https://go.dev/ref/spec#Rune_literals because PromQL and hence Alertmanager use the Go escaping rules -}
+
+
+unescapeOctal : String -> Maybe Char
+unescapeOctal s =
+    String.toList s
+        |> List.map (\ch -> Char.toCode ch - Char.toCode '0')
+        |> List.foldl
+            (\digit ->
+                Maybe.andThen
+                    (\i ->
+                        if digit >= 0 && digit < 8 then
+                            Just (i * 8 + digit)
+
+                        else
+                            Nothing
+                    )
+            )
+            (Just 0)
+        |> Maybe.map Char.fromCode
+
+
+unescapeHex : String -> Maybe Char
+unescapeHex s =
+    String.toLower s
+        |> Hex.fromString
+        |> Result.toMaybe
+        |> Maybe.map Char.fromCode
+
+
+escapes : List ( String, Char )
+escapes =
+    [ ( "\\a", '\u{0007}' )
+    , ( "\\b", '\u{0008}' )
+    , ( "\\f", '\u{000C}' )
+    , ( "\\n", '\n' )
+    , ( "\\r", '\u{000D}' )
+    , ( "\\t", '\t' )
+    , ( "\\v", '\u{000B}' )
+    , ( "\\\\", '\\' )
+    , ( "\\'", '\'' )
+    , ( "\\\"", '"' )
+    ]
+
+
+stateAppendMappedChompedString : StringHelpState -> (String -> Maybe Char) -> Parser () -> Parser (Parser.Step StringHelpState (Maybe String))
+stateAppendMappedChompedString state func parser =
+    Parser.getChompedString parser
+        |> Parser.map func
+        |> Parser.map
+            (\mch ->
+                case mch of
+                    Just ch ->
+                        Parser.Loop { state | chars = state.chars ++ [ ch ] }
+
+                    Nothing ->
+                        Parser.Done Nothing
+            )
+
+
+stringHelp : StringHelpState -> Parser (Parser.Step StringHelpState (Maybe String))
+stringHelp state =
     Parser.oneOf
-        [ Parser.succeed (Parser.Done ())
-            |. Parser.token (String.fromChar separator)
-        , Parser.succeed (Parser.Loop separator)
-            |. Parser.chompIf (\char -> char == '\\')
+        [ Parser.succeed (Parser.Done (Just (String.fromList state.chars)))
+            |. Parser.token (String.fromChar state.separator)
+        , Parser.succeed ()
+            |. Parser.token "\\x"
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |> stateAppendMappedChompedString state (String.dropLeft 2 >> unescapeHex)
+        , Parser.succeed ()
+            |. Parser.token "\\u"
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |> stateAppendMappedChompedString state (String.dropLeft 2 >> unescapeHex)
+        , Parser.succeed ()
+            |. Parser.token "\\U"
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |. Parser.chompIf Char.isHexDigit
+            |> stateAppendMappedChompedString state (String.dropLeft 2 >> unescapeHex)
+        , escapes
+            |> List.map
+                (\( escapeSequence, char ) ->
+                    Parser.succeed char
+                        |. Parser.token escapeSequence
+                )
+            |> Parser.oneOf
+            |> Parser.map (\ch -> Parser.Loop { state | chars = state.chars ++ [ ch ] })
+        , Parser.succeed ()
+            |. Parser.token "\\"
+            |. Parser.chompIf Char.isOctDigit
+            |. Parser.chompIf Char.isOctDigit
+            |. Parser.chompIf Char.isOctDigit
+            |> stateAppendMappedChompedString state (String.dropLeft 1 >> unescapeOctal)
+        , Parser.problem "unsupported escape sequence"
+            |. Parser.token "\\"
+        , Parser.succeed ()
             |. Parser.chompIf (\_ -> True)
-        , Parser.succeed (Parser.Loop separator)
-            |. Parser.chompIf (\char -> char /= '\\' && char /= separator)
+            |> stateAppendMappedChompedString state (String.toList >> List.head)
         ]
 
 
